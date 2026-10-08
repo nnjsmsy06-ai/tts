@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="読み上げ">
+<title>貼り付け読み上げ(OpenAI TTS)</title>
+<style>
+  :root{
+    --bg:#f5f7fa; --card:#ffffff; --ink:#1c2430; --sub:#5b6676;
+    --line:#d5dbe3; --accent:#1f6f8b; --accent-ink:#ffffff; --err:#b3261e;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{ --bg:#12171d; --card:#1b222b; --ink:#e8edf3; --sub:#9aa6b5; --line:#2e3844; --accent:#5bb5d1; --accent-ink:#0d1a20; --err:#ff8a80; }
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{background:var(--bg);color:var(--ink);font-family:"Hiragino Sans","Noto Sans JP",system-ui,sans-serif;line-height:1.6;padding:16px;padding-top:max(16px,env(safe-area-inset-top));padding-bottom:max(16px,env(safe-area-inset-bottom));max-width:640px;margin:0 auto}
+  h1{font-size:1.2rem;margin:4px 0 16px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:14px}
+  label{display:block;font-size:.85rem;color:var(--sub);margin:10px 0 4px}
+  label:first-child{margin-top:0}
+  input,select,textarea,button{font:inherit;font-size:16px;color:inherit;width:100%}
+  input,select,textarea{background:transparent;border:1px solid var(--line);border-radius:8px;padding:10px}
+  textarea{min-height:200px;resize:vertical}
+  input:focus,select:focus,textarea:focus,button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+  .row{display:flex;gap:10px}
+  .row>div{flex:1;min-width:0}
+  button{border:0;border-radius:8px;padding:12px;cursor:pointer;background:var(--accent);color:var(--accent-ink);font-weight:600;margin-top:12px}
+  button.ghost{background:transparent;color:var(--ink);border:1px solid var(--line)}
+  button:disabled{opacity:.5;cursor:default}
+  .meta{font-size:.82rem;color:var(--sub);margin-top:6px}
+  #status{min-height:1.4em;font-size:.9rem;margin-top:10px}
+  #status.err{color:var(--err)}
+  audio{width:100%;margin-top:12px}
+  .note{font-size:.8rem;color:var(--sub)}
+</style>
+</head>
+<body>
+<h1>貼り付け読み上げ</h1>
+
+<div class="card">
+  <label for="key">OpenAI APIキー(この端末のブラウザ内だけに保存)</label>
+  <input id="key" type="password" placeholder="sk-..." autocomplete="off">
+
+  <div class="row">
+    <div>
+      <label for="model">モデル</label>
+      <select id="model">
+        <option value="gpt-4o-mini-tts">gpt-4o-mini-tts(話し方を指示できる)</option>
+        <option value="tts-1-hd">tts-1-hd(高音質)</option>
+        <option value="tts-1">tts-1(軽量)</option>
+      </select>
+    </div>
+    <div>
+      <label for="voice">声</label>
+      <select id="voice">
+        <option>coral</option><option>marin</option><option>cedar</option>
+        <option>alloy</option><option>ash</option><option>ballad</option>
+        <option>echo</option><option>fable</option><option>nova</option>
+        <option>onyx</option><option>sage</option><option>shimmer</option><option>verse</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="row">
+    <div>
+      <label for="speed">速度(0.5〜2.0)</label>
+      <input id="speed" type="number" min="0.5" max="2" step="0.05" value="1.0" inputmode="decimal">
+    </div>
+    <div>
+      <label for="fmt">形式</label>
+      <select id="fmt"><option value="mp3">mp3</option></select>
+    </div>
+  </div>
+
+  <label for="inst">話し方の指示(gpt-4o-mini-ttsのみ有効)</label>
+  <input id="inst" type="text" value="落ち着いた、聞き取りやすい日本語で、一字一句そのまま読み上げてください。">
+</div>
+
+<div class="card">
+  <label for="text">読み上げるテキスト</label>
+  <textarea id="text" placeholder="ここに貼り付け"></textarea>
+  <div class="meta" id="count">0文字</div>
+  <button id="go">読み上げる</button>
+  <button id="dl" class="ghost" disabled>mp3を保存</button>
+  <div id="status" role="status"></div>
+  <audio id="player" controls hidden></audio>
+  <p class="note">長文は自動で分割して順に生成し、1本につなげます(1回の上限は4096文字)。</p>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let lastBlob = null;
+
+// 保存済みキーの復元(保存できない環境でも動くようtry/catch)
+try { $('key').value = localStorage.getItem('openai_key') || ''; } catch(e){}
+
+$('text').addEventListener('input', () => {
+  $('count').textContent = $('text').value.length + '文字';
+});
+
+function setStatus(msg, isErr){
+  const s = $('status'); s.textContent = msg; s.className = isErr ? 'err' : '';
+}
+
+// 文の区切りで3800文字以内に分割
+function splitText(text, max = 3800){
+  const sentences = text.replace(/\r/g,'').split(/(?<=[。!?!?\n])/);
+  const chunks = []; let cur = '';
+  for (const s of sentences){
+    if ((cur + s).length > max){
+      if (cur) chunks.push(cur);
+      if (s.length > max){
+        for (let i=0;i<s.length;i+=max) chunks.push(s.slice(i,i+max));
+        cur = '';
+      } else cur = s;
+    } else cur += s;
+  }
+  if (cur.trim()) chunks.push(cur);
+  return chunks;
+}
+
+async function synth(chunk, key){
+  const model = $('model').value;
+  const body = {
+    model, voice: $('voice').value, input: chunk,
+    response_format: 'mp3',
+    speed: Math.min(2, Math.max(0.5, parseFloat($('speed').value) || 1))
+  };
+  if (model === 'gpt-4o-mini-tts' && $('inst').value.trim()) body.instructions = $('inst').value.trim();
+  const res = await fetch('https://api.openai.com/v1/audio/speech', {
+    method:'POST',
+    headers:{ 'Authorization':'Bearer ' + key, 'Content-Type':'application/json' },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok){
+    let detail = '';
+    try { detail = (await res.json()).error?.message || ''; } catch(e){}
+    throw new Error('HTTP ' + res.status + ' ' + detail);
+  }
+  return await res.arrayBuffer();
+}
+
+$('go').addEventListener('click', async () => {
+  const key = $('key').value.trim();
+  const text = $('text').value.trim();
+  if (!key) return setStatus('APIキーを入力してください。', true);
+  if (!text) return setStatus('テキストを貼り付けてください。', true);
+  try { localStorage.setItem('openai_key', key); } catch(e){}
+
+  const chunks = splitText(text);
+  $('go').disabled = true; $('dl').disabled = true;
+  const parts = [];
+  try {
+    for (let i=0;i<chunks.length;i++){
+      setStatus('生成中… ' + (i+1) + ' / ' + chunks.length);
+      parts.push(await synth(chunks[i], key));
+    }
+    lastBlob = new Blob(parts, {type:'audio/mpeg'});
+    const p = $('player');
+    p.src = URL.createObjectURL(lastBlob);
+    p.hidden = false;
+    setStatus('完了。再生します。');
+    p.play().catch(() => setStatus('完了。再生ボタンを押してください。'));
+    $('dl').disabled = false;
+  } catch(e){
+    setStatus('失敗: ' + e.message, true);
+  } finally {
+    $('go').disabled = false;
+  }
+});
+
+$('dl').addEventListener('click', () => {
+  if (!lastBlob) return;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(lastBlob);
+  a.download = 'tts_' + new Date().toISOString().slice(0,10) + '.mp3';
+  a.click();
+});
+</script>
+</body>
+</html>
